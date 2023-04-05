@@ -1,5 +1,6 @@
 
 use std::{sync::atomic::{AtomicUsize, fence}, ptr::NonNull, ops::Deref, cell::UnsafeCell};
+use std::sync::atomic::Ordering::*;
 
 struct ArcData<T> {
     /// Number of `Arc`s
@@ -43,7 +44,7 @@ impl<T> Arc<T> {
     }
 
     pub fn get_mut(arc: &mut Self) -> Option<&mut T> {
-        if arc.data().ref_count.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+        if arc.weak.data().alloc_ref_count.load(Relaxed) == 1 {
             fence(std::sync::atomic::Ordering::Acquire);
             // Safety: Nothing else can access the data, since
             // there's only one Arc, to which we have exclusive access.
@@ -57,17 +58,31 @@ impl<T> Arc<T> {
 impl <T> Deref for Arc<T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
-        &self.data().data
+        let ptr = self.weak.data().data.get();
+         // Safety: Since there's an Arc to the data,
+        // the data exists and may be shared.
+        unsafe {(*ptr).as_ref().unwrap()}
     }
 }
 
 impl <T> Clone for Weak<T> {
     fn clone(&self) -> Self {
         // TODO: Handle overflows.
-        if self.data().ref_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > usize::MAX / 2 {
+        if self.data().data_ref_count.fetch_add(1, Relaxed) > usize::MAX / 2 {
             std::process::abort();
         }
         Weak { ptr: self.ptr }
+    }
+}
+
+impl <T> Drop for Weak<T> {
+    fn drop(&mut self) {
+        if self.data().alloc_ref_count.fetch_sub(1, Release) == 1 {
+            fence(Acquire);
+            unsafe {
+                drop(Box::from_raw(self.ptr.as_ptr()));
+            }
+        }
     }
 }
 
@@ -82,15 +97,16 @@ impl<T> Clone for Arc<T> {
 }
 
 
-
-
 impl <T> Drop for Arc<T> {
     fn drop(&mut self) {
         // TODO: Memory ordering
-        if self.data().ref_count.fetch_sub(1, std::sync::atomic::Ordering::Release) == 1 {
-            fence(std::sync::atomic::Ordering::Acquire);
+        if self.weak.data().data_ref_count.fetch_sub(1, Release) == 1 {
+            fence(Acquire);
+            let ptr = self.weak.data().data.get();
+             // Safety: The data reference counter is zero,
+            // so nothing will access it.
             unsafe {
-                drop(Box::from_raw(self.ptr.as_ptr()));
+                *ptr = None;
             }
         }
     }
