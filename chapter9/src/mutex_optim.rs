@@ -4,8 +4,8 @@ use atomic_wait::{wait, wake_one};
 
 pub struct  Mutex<T> {
     ///  0 : unlocked
-    ///  1: locked
-    /// 
+    ///  1: locked, no other threads waiting
+    ///  2: locked, other threads waiting
     state: AtomicU32,
     value: UnsafeCell<T>
 }
@@ -28,12 +28,11 @@ impl <T> Mutex<T> {
 
     pub fn lock(&mut self) -> MutexGuard<T> {
         // Set the state to 1: locked
-        while self.state.swap(1, std::sync::atomic::Ordering::Acquire) == 1 {
-            // If it was already locked..
-            // .. wait, unless the state is no longer 1.
-            wait(&self.state, 1)
+        if self.state.compare_exchange(0, 1, std::sync::atomic::Ordering::Acquire, std::sync::atomic::Ordering::Relaxed).is_err() {
+            while self.state.swap(2, std::sync::atomic::Ordering::Acquire) != 0 {
+                wait(&self.state, 2);
+            }
         }
-
         MutexGuard { mutex: self }
     }
 }
@@ -58,9 +57,9 @@ impl <T> DerefMut for MutexGuard<'_, T> {
 impl <T> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
         // Set the state back to  0: unlocked
-        self.mutex.state.store(0, std::sync::atomic::Ordering::Release);
-        // Wake up one of the waiting threads, if any
 
-        wake_one(&self.mutex.state);
+        if self.mutex.state.swap(0, std::sync::atomic::Ordering::Release) == 2 {
+            wake_one(&self.mutex.state);
+        }
     }
 }
